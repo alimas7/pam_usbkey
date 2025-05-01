@@ -17,6 +17,6 @@ jobs:
     - name: configure
       run: ./configure
     - name: install libpam0g-dev
-      sudo apt install libpam0g-dev
+      run: sudo apt install libpam0g-dev
     - name: make
       run: make
