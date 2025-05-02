@@ -11,10 +11,19 @@ datarootdir=@datarootdir@
 sysconfdir=@sysconfdir@
 FLAGS=$(CFLAGS) @DEFS@
 
-all: pam_usbkey.so
+all: pam_usbkey.so exe
+
+exe: main.o pam_tty_conv.o
+	$(CC) $(FLAGS) -oexe main.o pam_tty_conv.o -lpam /usr/lib/x86_64-linux-gnu/libaudit.so.1 -lc
+
+pam_tty_conv.o: pam_tty_conv.c
+	$(CC) $(FLAGS) -c pam_tty_conv.c
+
+main.o: main.c
+	$(CC) $(FLAGS) -c main.c
 
 pam_usbkey.so: common.h usbkey.o utility.o pam_module.c 
-	$(CC) $(FLAGS) -opam_usbkey.so -shared -lpam pam_module.c usbkey.o utility.o 
+	$(CC) $(FLAGS) -fPIC -opam_usbkey.so -shared pam_module.c usbkey.o utility.o -lpam
 	-strip pam_usbkey.so
 
 usbkey.o: usbkey.h usbkey.c
@@ -32,7 +41,7 @@ install: pam_usbkey.so listusbkeys.sh
 	$(INSTALL) pam_usbkey.8 $(DESTDIR)$(mandir)/man8
 
 clean:
-	-rm -f *.o *.so
+	-rm -f *.o *.so exe
 	-rm -f config.log config.status */config.log */config.status
 	-rm -fr autom4te.cache */autom4te.cache
 

@@ -1,0 +1,229 @@
+#include "common.h"
+#include "usbkey.h"
+#include "utility.h"
+#include <syslog.h>
+
+//Define which PAM interfaces we provide. In this case we are
+//only going to provide an authentication interface, i.e. one 
+//that decides if a login in allowed or not
+#define PAM_SM_AUTH
+
+// We do not supply these
+/*
+#define PAM_SM_ACCOUNT
+#define PAM_SM_PASSWORD
+#define PAM_SM_SESSION
+*/
+
+// Include PAM headers 
+#include <security/pam_appl.h>
+#include <security/pam_modules.h>
+
+
+
+int CheckAuthItem(const char *KeyList, const char *ActiveUSBKeys, const char *User, const char *TTY, const char *RHost)
+{
+char *MatchList=NULL;
+const char *ptr;
+int UserMatch=FALSE, KeyMatch=FALSE, TTYMatch=FALSE, HostMatch=FALSE;
+
+printf("\n\n    CheckAuthItem: KeyList = \"%s\"\nActiveUSBKeys = \"%s\"\nUser = \"%s\"\nTTY = \"%s\"\nRHost = \"%s\"\n", KeyList, ActiveUSBKeys, User, TTY, RHost);
+ptr=GetTok(KeyList, ' ', &MatchList);
+while (ptr)
+{
+printf("\n\n    CheckAuthItem: MatchList = \"%s\"\n", MatchList);
+	if (strncmp(MatchList,"rhost=",6)==0) HostMatch=ItemMatches(RHost, MatchList+6);
+	if (User)
+	{
+		if (strncmp(MatchList,"user=",5)==0) UserMatch=ItemMatches(User, MatchList+5);
+		if (strncmp(MatchList,"users=",6)==0) UserMatch=ItemMatches(User, MatchList+6);
+	}
+	if (TTY)
+	{
+		if (strncmp(MatchList,"tty=",4)==0) TTYMatch=ItemMatches(TTY, MatchList+4);
+		if (strncmp(MatchList,"ttys=",5)==0) TTYMatch=ItemMatches(TTY, MatchList+5);
+	}
+	if (KeyList)
+	{
+		if (strncmp(MatchList,"key=",4)==0) KeyMatch=ItemListMatches(ActiveUSBKeys, MatchList+4);
+		if (strncmp(MatchList,"keys=",5)==0) KeyMatch=ItemListMatches(ActiveUSBKeys, MatchList+5);
+	}
+ptr=GetTok(ptr, ' ', &MatchList);
+}
+
+Destroy(MatchList);
+
+printf("\n\n    CheckAuthItem: UserMatch = %d\nTTYMatch = %d\nHostMatch = %d\nKeyMatch = %d\n", UserMatch, TTYMatch, HostMatch, KeyMatch);
+if (UserMatch && (TTYMatch || HostMatch)) 
+{
+printf("\n\n    CheckAuthItem: KeyMatch = %d\n", KeyMatch);
+	if (! KeyMatch) return(PAM_PERM_DENIED);
+printf("\n\n    CheckAuthItem: returning PAM_SUCCESS");
+	return(PAM_SUCCESS);
+}
+
+printf("\n\n    CheckAuthItem: returning PAM_INGNORE");
+return(PAM_IGNORE);
+}
+
+
+int CheckAuth(const char *KeyList, const char *ActiveUSBKeys, const char *User, const char *TTY, const char *RHost)
+{
+char *KeyInfo=NULL;
+const char *ptr;
+int result=PAM_IGNORE;
+
+printf("\n\n  CheckAuth: KeyList = \"%s\"\nActiveUSBKeys = \"%s\"\nUser = \"%s\"\nTTY = \"%s\"\nRHost = \"%s\"\n", KeyList, ActiveUSBKeys, User, TTY, RHost);
+
+ptr=GetTok(KeyList, '|', &KeyInfo);
+while (ptr)
+{
+	StripTrailingWhitespace(KeyInfo);
+	StripLeadingWhitespace(KeyInfo);
+printf("\n\n  CheckAuth: KeyInfo = \"%s\"\nActiveUSBKeys = \"%s\"\nUser = \"%s\"\nTTY = \"%s\"\nRHost = \"%s\"\n", KeyInfo, ActiveUSBKeys, User, TTY, RHost);
+	result=CheckAuthItem(KeyInfo, ActiveUSBKeys, User, TTY, RHost);
+printf("\n\n  CheckAuth: result = %d\n", result);
+	ptr=GetTok(ptr, '|', &KeyInfo);
+}
+
+Destroy(KeyInfo);
+
+return(result);
+}
+
+
+// PAM entry point for authentication. This function gets called by pam when
+//a login occurs. argc and argv work just like argc and argv for the 'main' 
+//function of programs, except they pass in the options defined for this
+//module in the pam configuration files in /etc/pam.conf or /etc/pam.d/
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) 
+{
+	char *Tempstr=NULL, *KeyList=NULL;
+	char *ActiveUSBKeys=NULL;
+	const char *ptr;
+	int result=PAM_IGNORE, i;
+
+	//These are defined as 'const char' because they passwd to us from the parent
+	//library. When we called pam_get_<whatever> the pam library passes pointers
+	//to strings in it's own code. Thus we must not change or free them
+	const char *pam_user = NULL, *pam_tty=NULL, *pam_rhost=NULL;
+
+printf("pam_sm_authenticate: %x, %d, %d, %x\n", pamh, flags, argc, argv);
+	//get the user. If something goes wrong we return PAM_IGNORE. This tells
+	//pam that our module failed in some way, so ignore it. Perhaps we should
+	//return PAM_PERM_DENIED to deny login, but this runs the risk of a broken
+	//module preventing anyone from logging into the system!
+int r;
+	if (r = pam_get_user(pamh, &pam_user, NULL) != PAM_SUCCESS) return(PAM_IGNORE);
+printf("pam_sm_authenticate >>> pam_get_user: r = %d\n", r);
+	if (pam_user == NULL) return(PAM_IGNORE);
+
+	//perhaps there will not be a tty if we are logging in remotely
+	r = pam_get_item(pamh, PAM_TTY, (const void **) &pam_tty);
+printf("pam_sm_authenticate >>> pam_get_item PAM_TTY: r = %d\n", r);
+	if (! pam_tty) pam_tty="";
+
+	//perhaps there will not be a remote host if we are logging in locally
+	r = pam_get_item(pamh, PAM_RHOST, (const void **) &pam_rhost);
+printf("pam_sm_authenticate >>> pam_get_item PAM_RHOST: r = %d\n", r);
+	if (! pam_rhost) pam_rhost="";
+
+
+const char *pam_v = NULL;
+printf("### pam_get_item PAM_SERVICE: %s\n", !pam_get_item(pamh, PAM_SERVICE, (const void **)&pam_v) ? pam_v : "NADA");
+//printf("### pam_get_item PAM_USER: %s\n", !pam_get_item(pamh, PAM_USER, (const void **)&pam_v) ? pam_v : "NADA");
+printf("### pam_get_item PAM_USER_PROMPT: %s\n", !pam_get_item(pamh, PAM_USER_PROMPT, (const void **)&pam_v) ? pam_v : "NADA");
+printf("### pam_get_item PAM_TTY: %s\n", !pam_get_item(pamh, PAM_TTY, (const void **)&pam_v) ? pam_v : "NADA");
+printf("### pam_get_item PAM_RUSER: %s\n", !pam_get_item(pamh, PAM_RUSER, (const void **)&pam_v) ? pam_v : "NADA");
+printf("### pam_get_item PAM_RHOST: %s\n", !pam_get_item(pamh, PAM_RHOST, (const void **)&pam_v) ? pam_v : "NADA");
+printf("### pam_get_item PAM_CONV: %s\n", !pam_get_item(pamh, PAM_CONV, (const void **)&pam_v) ? pam_v : "NADA");
+printf("### pam_get_item PAM_FAIL_DELAY: %s\n", !pam_get_item(pamh, PAM_FAIL_DELAY, (const void **)&pam_v) ? pam_v : "NADA");
+printf("### pam_get_item PAM_XDISPLAY: %s\n", !pam_get_item(pamh, PAM_XDISPLAY, (const void **)&pam_v) ? pam_v : "NADA");
+printf("### pam_get_item PAM_XAUTHDATA: %s\n", !pam_get_item(pamh, PAM_XAUTHDATA, (const void **)&pam_v) ? pam_v : "NADA");
+printf("### pam_get_item PAM_AUTHTOK_TYPE: %s\n", !pam_get_item(pamh, PAM_AUTHTOK_TYPE, (const void **)&pam_v) ? pam_v : "NADA");
+
+	for (i=0; i < argc; i++)
+	{
+		ptr=argv[i];
+
+		if (strncmp(ptr,"key=",4)==0)   Tempstr=MCatStr(Tempstr, ptr, " ", NULL);
+		if (strncmp(ptr,"keys=",5)==0)  Tempstr=MCatStr(Tempstr, ptr, " ", NULL);
+		if (strncmp(ptr,"tty=",4)==0)   Tempstr=MCatStr(Tempstr, ptr, " ", NULL);
+		if (strncmp(ptr,"ttys=",5)==0)  Tempstr=MCatStr(Tempstr, ptr, " ", NULL);
+		if (strncmp(ptr,"user=",5)==0)  Tempstr=MCatStr(Tempstr, ptr, " ", NULL);
+		if (strncmp(ptr,"users=",6)==0) Tempstr=MCatStr(Tempstr, ptr, " ", NULL);
+		if (strncmp(ptr,"rhost=",6)==0) Tempstr=MCatStr(Tempstr, ptr, " ", NULL);
+		if (strncmp(ptr,"rhosts=",7)==0) Tempstr=MCatStr(Tempstr, ptr, " ", NULL);
+	}
+
+printf("\n\npam_sm_authenticate: Tempstr = \"%s\", StrLen(Tempstr) = %d\n", Tempstr, StrLen(Tempstr));
+	if (StrLen(Tempstr)) KeyList=MCopyStr(KeyList, Tempstr, "|", NULL);
+
+printf("\n\npam_sm_authenticate: KeyList = \"%s\"\n", KeyList);
+
+
+	ActiveUSBKeys=LoadActiveUSBSerialNums(ActiveUSBKeys);
+printf("\n\npam_sm_authenticate: KeyList = \"%s\"\nActiveUSBKeys = \"%s\"\npam_user = \"%s\"\npam_tty = \"%s\"\npam_rhost = \"%s\"\n", KeyList, ActiveUSBKeys, pam_user, pam_tty, pam_rhost);
+	result=CheckAuth(KeyList, ActiveUSBKeys, pam_user, pam_tty, pam_rhost);
+printf("\n\npam_sm_authenticate: result = %d\n", result);
+
+	Destroy(ActiveUSBKeys);
+	Destroy(Tempstr);
+	Destroy(KeyList);
+
+  return(result);
+}
+
+
+//We do not provide any of the below functions, we could just leave them out
+//but apparently it's considered good practice to supply them and return
+//'PAM_IGNORE'
+
+//PAM entry point for starting sessions. This is called after a user has 
+//passed all authentication. It allows a PAM module to perform certain tasks
+//on login, like recording the login occured, or printing a message of the day
+int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **argv) 
+{
+	return(PAM_IGNORE);
+}
+
+
+//PAM entry point for ending sessions. This is called when a user logs out
+//It allows a PAM module to perform certain tasks on logout
+//like recording the logout occured, or clearing up temporary files
+int pam_sm_close_session(pam_handle_t *pamh, int flags, int argc, const char **argv)
+{
+	return(PAM_IGNORE);
+}
+
+// PAM entry point for 'account management'. This decides whether a user
+// who has already been authenticated by pam_sm_authenticate should be
+// allowed to log in (it considers other things than the users password)
+// Really this is what we should have used here
+int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv){
+	return(PAM_IGNORE);
+}
+
+
+//PAM entry point for setting 'credentials' or properties of the user
+//If our module stores or produces extra information about a user (e.g.
+//a kerberous ticket or geolocation value) then it will pass this information
+//to a PAM aware program in this call
+int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) 
+{
+	return(PAM_IGNORE);
+}
+
+// PAM entry point for changing passwords. If our module stores passwords
+// then this will be called whenever one needs changing
+int pam_sm_chauthtok(pam_handle_t *pamh, int flags, int argc, const char **argv)
+{
+	return(PAM_IGNORE);
+}
+
+
+//I couldn't find any documentation on this. I think it notifies PAM of our
+//module name
+#ifdef PAM_MODULE_ENTRY
+PAM_MODULE_ENTRY("pam_usbkey");
+#endif
